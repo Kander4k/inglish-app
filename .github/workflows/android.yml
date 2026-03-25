@@ -44,8 +44,16 @@ jobs:
         run: |
           python -m flet_cli.cli build apk --module-name main
 
+      - name: List APK files
+        run: |
+          find build -type f \( -name "*.apk" -o -name "*.aab" \) | sort || true
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: apk-release
-          path: build/apk/app-release.apk
+          path: |
+            build/apk/*.apk
+            build/flutter/build/app/outputs/apk/**/*.apk
+            build/flutter/build/app/outputs/flutter-apk/**/*.apk
+          if-no-files-found: error
