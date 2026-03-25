@@ -1,0 +1,4 @@
+deep-translator==1.11.4
+flet==0.80.5
+flet-audio==0.80.5
+requests==2.32.5

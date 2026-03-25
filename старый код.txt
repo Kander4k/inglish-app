@@ -1,0 +1,1175 @@
+import flet as ft
+import flet_audio as fta
+import json
+import os
+import re
+import difflib
+import requests
+import asyncio
+import concurrent.futures
+import shutil
+from datetime import datetime, timedelta
+from functools import lru_cache
+from deep_translator import GoogleTranslator
+
+# --- НАСТРОЙКИ ---
+SECRET_PASSWORD = "12345"
+
+# --- РАСШИРЕННЫЙ ФИЛЬТР МАТА + ВЗРОСЛЫЙ КОНТЕНТ ---
+BAD_WORDS_RU = {
+    # ❌ МАТ
+    'шлюх', 'шлюхе', 'шлюху', 'шлюха', 'шлюхой', 'бля', 'блядь', 'бляди', 'блядей',
+    'пизд', 'пизде', 'пизду', 'пизда', 'пиздой', 'хуй', 'хуя', 'хуем', 'пидор', 'пидора',
+    'ебал', 'ебать', 'нахуй', 'похуй', 'охуе', 'охуеть', 'сука', 'суки', 'сукой',
+    'пидорас', 'пидорасе', 'пидорасом', 'мудак', 'мудака', 'мудаком', 'мудаке',
+    'пиздец', 'пиздецом', 'пиздеца', 'напиздел', 'напиздила',
+
+    # ❌ ВЗРОСЛЫЙ КОНТЕНТ
+    'секс', 'сексуал', 'сексуалк', 'сексуальн', 'порно', 'порнух', 'порнох',
+    'орги', 'оргазм', 'мастурб', 'мастурбац', 'мастурбир',
+    'изнасил', 'изнасилов', 'трах', 'трахал', 'трахать', 'трахнул', 'трахну',
+    'сперма', 'спермы', 'сперму', 'вагина', 'вагин', 'клитор', 'клитора',
+    'пенис', 'пениса', 'член', 'члена', 'членов', 'яйцо', 'яйца', 'яйцами',
+    'анал', 'анала', 'ректум', 'ректума', 'проститут', 'проституц',
+    'стриптиз', 'стриптизер', 'эротик', 'эротика', 'фетиш',
+    'бдсм', 'лесбиянк', 'лесбиян', 'гей', 'трансвестит',
+    'инцест', 'инцеста', 'зоофилия', 'зоофил', 'сквирт', 'сквирта'
+}
+
+
+def is_bad_translation(text: str) -> bool:
+    text_lower = text.lower()
+    for bad in BAD_WORDS_RU:
+        if bad in text_lower:
+            return True
+    words = text_lower.split()
+    if len(words) == 1:
+        word = words[0]
+        suspicious = {'шлюх', 'пизд', 'хуй', 'сук', 'мудак', 'член', 'трах', 'анал', 'секс'}
+        if word in suspicious:
+            return True
+    return False
+
+
+# --- ФАЙЛЫ ---
+DATA_FILE = os.path.join(os.path.expanduser("~"), "my_glossary.json")
+BACKUP_DIR = os.path.join(os.path.expanduser("~"), "my_glossary_backups")
+
+HISTORY_FILE = os.path.join(os.path.expanduser("~"), "my_glossary_history.json")
+HISTORY_LIMIT = 100
+
+FAVORITES_FILE = os.path.join(os.path.expanduser("~"), "my_glossary_favorites.json")
+
+TRAIN_FILE = os.path.join(os.path.expanduser("~"), "my_glossary_training.json")
+
+
+# --- FAVORITES ---
+def load_favorites() -> set[str]:
+    if not os.path.exists(FAVORITES_FILE):
+        return set()
+    try:
+        with open(FAVORITES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return set(x.lower() for x in data if isinstance(x, str))
+    except:
+        pass
+    return set()
+
+
+def save_favorites(favs: set[str]):
+    try:
+        with open(FAVORITES_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(favs)), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка сохранения избранного:", e)
+
+
+# --- HISTORY ---
+def load_history() -> list[str]:
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except:
+        return []
+
+
+def save_history(history: list[str]):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка сохранения истории:", e)
+
+
+def add_to_history(history: list[str], word: str) -> list[str]:
+    w = (word or "").strip().lower()
+    if not w:
+        return history
+    history = [x for x in history if x != w]
+    history.insert(0, w)
+    return history[:HISTORY_LIMIT]
+
+
+# --- TRAINING DATA ---
+def load_training() -> dict:
+    if not os.path.exists(TRAIN_FILE):
+        return {}
+    try:
+        with open(TRAIN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except:
+        return {}
+
+
+def save_training(training: dict):
+    try:
+        with open(TRAIN_FILE, "w", encoding="utf-8") as f:
+            json.dump(training, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка сохранения тренировки:", e)
+
+
+# --- LOCAL DATA ---
+def load_local_data() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+
+def save_local_data(data: dict):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Ошибка сохранения словаря: {e}")
+
+
+# --- BACKUP ---
+def ensure_backup_dir():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def create_backup():
+    ensure_backup_dir()
+    if not os.path.exists(DATA_FILE):
+        return None
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_path = os.path.join(BACKUP_DIR, f"my_glossary_backup_{ts}.json")
+    shutil.copy2(DATA_FILE, backup_path)
+    return backup_path
+
+
+def get_latest_backup_path():
+    if not os.path.isdir(BACKUP_DIR):
+        return None
+    files = [f for f in os.listdir(BACKUP_DIR) if f.lower().endswith(".json")]
+    if not files:
+        return None
+    files.sort(reverse=True)
+    return os.path.join(BACKUP_DIR, files[0])
+
+
+def restore_latest_backup():
+    latest = get_latest_backup_path()
+    if not latest:
+        return None
+    shutil.copy2(latest, DATA_FILE)
+    return latest
+
+
+# --- TRANSLATION ---
+def is_russian(text: str) -> bool:
+    return bool(re.search('[а-яА-Я]', text))
+
+
+def is_lazy_translation(word: str, translation: str) -> bool:
+    trans = translation.lower().strip()
+    if len(trans.split()) == 1:
+        if difflib.SequenceMatcher(None, word.lower(), trans).ratio() > 0.6:
+            return True
+    return False
+
+
+@lru_cache(maxsize=500)
+def translate_text(text: str, original_word: str) -> str:
+    try:
+        translator = GoogleTranslator(source='auto', target='ru')
+        res = translator.translate(text)
+        if res and is_russian(res):
+            if not is_bad_translation(res) and not is_lazy_translation(original_word, res):
+                return res
+    except:
+        pass
+    return ""
+
+
+def smart_merge(text1: str, text2: str) -> str:
+    t1 = text1.strip().rstrip('.')
+    t2 = text2.strip().rstrip('.')
+    w1 = t1.split()
+    w2 = t2.split()
+    common_tail = []
+    while w1 and w2 and w1[-1].lower() == w2[-1].lower():
+        common_tail.insert(0, w1.pop())
+        w2.pop()
+    if not common_tail:
+        return f"{t1.capitalize()} / {t2.capitalize()}"
+    head1 = " ".join(w1).capitalize()
+    head2 = " ".join(w2).capitalize()
+    tail = " ".join(common_tail)
+    if head1 and head2:
+        return f"{head1} / {head2} {tail}"
+    return f"{(head1 or head2)} {tail}".strip().capitalize()
+
+
+def _process_single_definition(d: dict, pos: str, word: str):
+    eng_def = d.get("definition", "")
+    clean = re.sub(r'^\s*\(.*?\)\s*', '', eng_def)
+    clean = re.sub(r'^(a|an|the)\s+', '', clean, flags=re.IGNORECASE)
+    rus_def = translate_text(clean, word)
+    if rus_def:
+        return {"rus": rus_def.strip().rstrip('.'), "ex": d.get("example", ""), "pos": pos}
+    return None
+
+
+def heavy_search_task(word: str, local_data: dict):
+    final_results = []
+    audio_url = None
+    try:
+        if word in local_data:
+            for item in local_data[word]:
+                final_results.append({"rus": item["rus"], "ex": item["ex"], "pos": "МОЁ", "is_local": True})
+
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+        resp = requests.get(url, timeout=10)
+
+        if resp.status_code == 200:
+            data_json = resp.json()
+
+            # --- AUDIO (pronunciation) ---
+            try:
+                for entry in data_json:
+                    for ph in entry.get("phonetics", []):
+                        a = (ph.get("audio") or "").strip()
+                        if not a:
+                            continue
+                        if a.startswith("//"):
+                            a = "https:" + a
+                        if not a.startswith("http"):
+                            continue
+                        audio_url = a
+                        raise StopIteration
+            except StopIteration:
+                pass
+            except:
+                pass
+
+            raw_online = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = []
+                for entry in data_json:
+                    for meaning in entry.get("meanings", []):
+                        pos = (meaning.get("partOfSpeech", "общее") or "общее").upper()
+                        for d in meaning.get("definitions", []):
+                            futures.append(executor.submit(_process_single_definition, d, pos, word))
+                for future in concurrent.futures.as_completed(futures):
+                    res = future.result()
+                    if res:
+                        raw_online.append(res)
+
+            for res in raw_online:
+                merged = False
+                for existing in [x for x in final_results if not x.get("is_local")]:
+                    if difflib.SequenceMatcher(None, res["rus"].lower(), existing["rus"].lower()).ratio() > 0.35:
+                        existing["rus"] = smart_merge(existing["rus"], res["rus"])
+                        merged = True
+                        break
+                if not merged:
+                    res["rus"] = res["rus"].capitalize()
+                    final_results.append(res)
+    except:
+        pass
+
+    return {"results": final_results, "audio_url": audio_url}
+
+
+# --- UI ---
+async def main(page: ft.Page):
+    page.title = "Переводчик"
+    page.theme_mode = ft.ThemeMode.DARK
+    page.padding = 10
+    page.scroll = ft.ScrollMode.ADAPTIVE
+
+    local_data = load_local_data()
+    history = load_history()
+    favorites = load_favorites()
+    training = load_training()
+    pending_action = {"type": None, "data": None}
+
+    # --- AUDIO CONTROL (flet-audio) ---
+    audio = fta.Audio(src="", autoplay=False, volume=1.0)
+    page.overlay.append(audio)
+
+    def now_ts() -> int:
+        return int(datetime.now().timestamp())
+
+    def today_key() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def ensure_training_meta():
+        if "_meta" not in training or not isinstance(training.get("_meta"), dict):
+            training["_meta"] = {}
+        meta = training["_meta"]
+        meta.setdefault("daily", {})
+        meta.setdefault("last_use", 0)
+        return meta
+
+    def bump_stats(known: bool):
+        meta = ensure_training_meta()
+        k = today_key()
+        daily = meta["daily"]
+        if k not in daily or not isinstance(daily.get(k), dict):
+            daily[k] = {"known": 0, "dont": 0}
+        if known:
+            daily[k]["known"] += 1
+        else:
+            daily[k]["dont"] += 1
+        meta["last_use"] = now_ts()
+
+    def build_training_pool() -> list[str]:
+        pool = set(local_data.keys()) | set(favorites)
+        pool = {w.strip().lower() for w in pool if isinstance(w, str) and w.strip()}
+        return sorted(pool)
+
+    def get_card_stats(word: str) -> dict:
+        st = training.get(word)
+        if not isinstance(st, dict):
+            st = {"interval": 0, "ease": 2.0, "next_due": 0}
+            training[word] = st
+        st.setdefault("interval", 0)
+        st.setdefault("ease", 2.0)
+        st.setdefault("next_due", 0)
+        return st
+
+    def pick_next_card(pool: list[str]) -> str | None:
+        t = now_ts()
+        due = []
+        future = []
+        for w in pool:
+            st = get_card_stats(w)
+            if int(st.get("next_due", 0)) <= t:
+                due.append(w)
+            else:
+                future.append((int(st.get("next_due", 0)), w))
+        if due:
+            import random
+            return random.choice(due)
+        if future:
+            future.sort(key=lambda x: x[0])
+            return future[0][1]
+        return None
+
+    def get_best_translation_for_word(word: str) -> str:
+        if word in local_data and local_data[word]:
+            first = local_data[word][0].get("rus", "")
+            if first:
+                return first
+        try:
+            tr = GoogleTranslator(source="en", target="ru").translate(word)
+            return tr.strip() if tr else ""
+        except:
+            return ""
+
+    def schedule_known(word: str):
+        st = get_card_stats(word)
+        ease = float(st.get("ease", 2.0))
+        interval = int(st.get("interval", 0))
+        ease = min(2.7, ease + 0.10)
+        interval = 1 if interval <= 0 else int(max(1, round(interval * ease)))
+        st["ease"] = ease
+        st["interval"] = interval
+        st["next_due"] = now_ts() + interval * 24 * 3600
+
+    def schedule_dontknow(word: str):
+        st = get_card_stats(word)
+        ease = float(st.get("ease", 2.0))
+        ease = max(1.3, ease - 0.20)
+        st["ease"] = ease
+        st["interval"] = 1
+        st["next_due"] = now_ts() + 1 * 24 * 3600
+
+    def current_word() -> str:
+        return search_field.value.strip().lower()
+
+    # ---------------------------------------------
+    # ЭЛЕМЕНТЫ UI (Словарь)
+    # ---------------------------------------------
+    search_field = ft.TextField(label="Введите слово...", border_radius=10, expand=True, text_size=16)
+    results_column = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True, spacing=10)
+    progress_bar = ft.ProgressBar(visible=False, color=ft.Colors.BLUE_400)
+    search_btn = ft.IconButton(icon=ft.Icons.SEARCH, icon_size=30, tooltip="Поиск")
+
+    current_audio_url = {"url": None}
+
+    # ---------------------------------------------
+    # ДИАЛОГИ (пароль / редактор)
+    # ---------------------------------------------
+    dlg_pass = ft.TextField(label="Пароль", password=True, can_reveal_password=True, autofocus=True)
+    dlg_word = ft.TextField(label="Слово (англ.)")
+    dlg_def = ft.TextField(label="Перевод (рус.)")
+    dlg_ex = ft.TextField(label="Пример (англ.)")
+
+    async def close_auth(e):
+        auth_dialog.open = False
+        dlg_pass.value = ""
+        page.update()
+
+    async def check_password(e):
+        if dlg_pass.value == SECRET_PASSWORD:
+            dlg_pass.value = ""
+            dlg_pass.error_text = None
+            auth_dialog.open = False
+            page.update()
+
+            action = pending_action["type"]
+            data = pending_action["data"]
+
+            if action == "add":
+                dlg_word.value = ""
+                dlg_def.value = ""
+                dlg_ex.value = ""
+                dlg_word.read_only = False
+                add_dialog.open = True
+                page.update()
+
+            elif action == "edit":
+                word = data["word"]
+                index = data["index"]
+                item = local_data[word][index]
+
+                dlg_word.value = word
+                dlg_word.read_only = True
+                dlg_def.value = item["rus"]
+                dlg_ex.value = item["ex"]
+                add_dialog.data = index
+                add_dialog.open = True
+                page.update()
+
+            elif action == "delete":
+                word = data["word"]
+                index = data["index"]
+                if word in local_data and 0 <= index < len(local_data[word]):
+                    del local_data[word][index]
+                    if not local_data[word]:
+                        del local_data[word]
+                    save_local_data(local_data)
+                    await show_all_words(None)
+        else:
+            dlg_pass.error_text = "Неверный пароль!"
+            page.update()
+
+    auth_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Проверка доступа"),
+        content=ft.Column([ft.Text("Введите пароль:"), dlg_pass], tight=True, width=300),
+        actions=[ft.TextButton("Отмена", on_click=close_auth), ft.TextButton("Войти", on_click=check_password)],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+    dlg_pass.on_submit = check_password
+
+    async def close_add_dialog(e):
+        add_dialog.open = False
+        page.update()
+
+    async def save_word_data(e):
+        w = dlg_word.value.strip().lower()
+        d = dlg_def.value.strip()
+        ex = dlg_ex.value.strip()
+
+        if not w or not d:
+            dlg_word.error_text = "Обязательно" if not w else None
+            dlg_def.error_text = "Обязательно" if not d else None
+            page.update()
+            return
+
+        if w not in local_data:
+            local_data[w] = []
+
+        if pending_action["type"] == "edit":
+            index = add_dialog.data
+            if 0 <= index < len(local_data[w]):
+                local_data[w][index] = {"rus": d.capitalize(), "ex": ex}
+            else:
+                local_data[w].append({"rus": d.capitalize(), "ex": ex})
+        else:
+            local_data[w].append({"rus": d.capitalize(), "ex": ex})
+
+        save_local_data(local_data)
+        add_dialog.open = False
+        page.update()
+
+        if pending_action["type"] == "edit":
+            await show_all_words(None)
+        else:
+            search_field.value = w
+            await run_search_async(None)
+
+    add_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Редактор слова"),
+        content=ft.Column([dlg_word, dlg_def, dlg_ex], tight=True, width=300),
+        actions=[ft.TextButton("Отмена", on_click=close_add_dialog), ft.TextButton("Сохранить", on_click=save_word_data)],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+
+    page.overlay.append(auth_dialog)
+    page.overlay.append(add_dialog)
+
+    # ---------------------------------------------
+    # ДИАЛОГ: ИСТОРИЯ
+    # ---------------------------------------------
+    history_column = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO, height=420)
+
+    async def close_history_dialog(e):
+        history_dialog.open = False
+        page.update()
+
+    async def clear_history(e):
+        nonlocal history
+        history = []
+        save_history(history)
+        history_column.controls = [ft.Text("История очищена.", color=ft.Colors.GREY_400)]
+        page.update()
+
+    async def use_history_click(e):
+        word = (e.control.data or "").strip().lower()
+        if not word:
+            return
+        search_field.value = word
+        page.update()
+        await run_search_async(None)
+
+    async def open_history_dialog(e=None):
+        history_column.controls.clear()
+        if not history:
+            history_column.controls.append(ft.Text("История пуста.", color=ft.Colors.GREY_400))
+        else:
+            for w in history:
+                history_column.controls.append(
+                    ft.ListTile(
+                        title=ft.Text(w),
+                        leading=ft.Icon(ft.Icons.SEARCH),
+                        data=w,
+                        on_click=use_history_click,
+                    )
+                )
+        history_dialog.open = True
+        page.update()
+
+    history_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("История запросов"),
+        content=history_column,
+        actions=[ft.TextButton("Очистить", on_click=clear_history), ft.TextButton("Закрыть", on_click=close_history_dialog)],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+    page.overlay.append(history_dialog)
+
+    # ---------------------------------------------
+    # ДИАЛОГ: ИЗБРАННОЕ
+    # ---------------------------------------------
+    favorites_column = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO, height=420)
+
+    async def close_favorites_dialog(e):
+        favorites_dialog.open = False
+        page.update()
+
+    async def clear_favorites(e):
+        nonlocal favorites
+        favorites = set()
+        save_favorites(favorites)
+        favorites_column.controls = [ft.Text("Избранное очищено.", color=ft.Colors.GREY_400)]
+        refresh_stats_view()
+        refresh_menu_states()
+        page.update()
+
+    async def use_favorite_click(e):
+        word = (e.control.data or "").strip().lower()
+        if not word:
+            return
+        search_field.value = word
+        page.update()
+        await run_search_async(None)
+
+    async def remove_favorite_click(e):
+        nonlocal favorites
+        word = (e.control.data or "").strip().lower()
+        if word in favorites:
+            favorites.remove(word)
+            save_favorites(favorites)
+        await open_favorites_dialog(None)
+        refresh_stats_view()
+        refresh_menu_states()
+        page.update()
+
+    async def open_favorites_dialog(e=None):
+        favorites_column.controls.clear()
+        favs_sorted = sorted(list(favorites))
+        if not favs_sorted:
+            favorites_column.controls.append(ft.Text("Избранных слов нет.", color=ft.Colors.GREY_400))
+        else:
+            for w in favs_sorted:
+                favorites_column.controls.append(
+                    ft.ListTile(
+                        title=ft.Text(w),
+                        leading=ft.Icon(ft.Icons.STAR, color=ft.Colors.AMBER),
+                        trailing=ft.IconButton(
+                            icon=ft.Icons.DELETE,
+                            tooltip="Убрать из избранного",
+                            data=w,
+                            on_click=remove_favorite_click,
+                        ),
+                        data=w,
+                        on_click=use_favorite_click,
+                    )
+                )
+        favorites_dialog.open = True
+        page.update()
+
+    favorites_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Избранные слова ⭐"),
+        content=favorites_column,
+        actions=[ft.TextButton("Очистить", on_click=clear_favorites), ft.TextButton("Закрыть", on_click=close_favorites_dialog)],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+    page.overlay.append(favorites_dialog)
+
+    # ---------------------------------------------
+    # ОБРАБОТЧИКИ: добавление/редактирование/удаление
+    # ---------------------------------------------
+    async def request_auth(action_type, data=None):
+        pending_action["type"] = action_type
+        pending_action["data"] = data
+        auth_dialog.open = True
+        page.update()
+
+    async def handle_fab_click(e=None):
+        await request_auth("add")
+
+    async def handle_edit_click(e):
+        await request_auth("edit", e.control.data)
+
+    async def handle_delete_click(e):
+        await request_auth("delete", e.control.data)
+
+    # ---------------------------------------------
+    # БЭКАП / ВОССТАНОВЛЕНИЕ
+    # ---------------------------------------------
+    async def handle_backup_click(e=None):
+        try:
+            path = create_backup()
+            if not path:
+                page.snack_bar = ft.SnackBar(ft.Text("Нет файла для бэкапа (my_glossary.json не найден)."))
+            else:
+                page.snack_bar = ft.SnackBar(ft.Text(f"Бэкап создан: {path}"))
+            page.snack_bar.open = True
+            page.update()
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка бэкапа: {ex}"))
+            page.snack_bar.open = True
+            page.update()
+
+    async def handle_restore_click(e=None):
+        try:
+            restored_from = restore_latest_backup()
+            if not restored_from:
+                page.snack_bar = ft.SnackBar(ft.Text("Бэкапы не найдены."))
+                page.snack_bar.open = True
+                page.update()
+                return
+
+            nonlocal local_data
+            local_data = load_local_data()
+
+            page.snack_bar = ft.SnackBar(ft.Text(f"Восстановлено из: {restored_from}"))
+            page.snack_bar.open = True
+            page.update()
+
+            await show_all_words(None)
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Ошибка восстановления: {ex}"))
+            page.snack_bar.open = True
+            page.update()
+
+    # ---------------------------------------------
+    # ОЗВУЧКА (через flet-audio)
+    # ---------------------------------------------
+    async def handle_speak_click(e=None):
+        url = current_audio_url.get("url")
+        if not url:
+            page.snack_bar = ft.SnackBar(ft.Text("Озвучка недоступна для этого слова."))
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        try:
+            audio.src = url
+            await audio.play()
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(ft.Text(f"Не удалось воспроизвести аудио: {ex}"))
+            page.snack_bar.open = True
+            page.update()
+
+    # ---------------------------------------------
+    # ИЗБРАННОЕ: только для ИСКОМОГО слова
+    # ---------------------------------------------
+    async def toggle_favorite_searched_word(e=None):
+        nonlocal favorites
+        w = current_word()
+        if not w:
+            return
+        if w in favorites:
+            favorites.remove(w)
+        else:
+            favorites.add(w)
+        save_favorites(favorites)
+        refresh_stats_view()
+        refresh_menu_states()
+        page.update()
+
+    # ---------------------------------------------
+    # СПИСОК МОИХ СЛОВ
+    # ---------------------------------------------
+    async def show_all_words(e=None):
+        search_field.value = ""
+        results_column.controls.clear()
+
+        if not local_data:
+            results_column.controls.append(ft.Text("Словарь пуст.", size=18, color=ft.Colors.GREY))
+            refresh_stats_view()
+            refresh_menu_states()
+            page.update()
+            return
+
+        sorted_words = sorted(local_data.keys())
+        total_items = sum(len(v) for v in local_data.values())
+
+        all_cards = [ft.Text(f"Мой словарь ({total_items} записей)", size=20, weight="bold")]
+
+        for word in sorted_words:
+            for i, item in enumerate(local_data[word]):
+                content = ft.Column([
+                    ft.Row([
+                        ft.Text(word.capitalize(), size=22, weight="bold", color=ft.Colors.GREEN_300, expand=True),
+                        ft.IconButton(
+                            icon=ft.Icons.EDIT,
+                            icon_color=ft.Colors.BLUE_200,
+                            tooltip="Редактировать",
+                            data={"word": word, "index": i},
+                            on_click=handle_edit_click,
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.DELETE,
+                            icon_color=ft.Colors.RED_200,
+                            tooltip="Удалить",
+                            data={"word": word, "index": i},
+                            on_click=handle_delete_click,
+                        ),
+                    ]),
+                    ft.Text(item["rus"], size=18, weight="w500"),
+                ])
+
+                if item["ex"]:
+                    content.controls.append(ft.Divider(height=10, color=ft.Colors.GREY_800))
+                    content.controls.append(ft.Text(f"\"{item['ex']}\"", italic=True, color=ft.Colors.GREY_400, size=14))
+
+                all_cards.append(ft.Container(
+                    content=content,
+                    padding=15,
+                    bgcolor=ft.Colors.GREEN_900,
+                    border=ft.Border.all(1, ft.Colors.GREEN_400),
+                    border_radius=12,
+                    margin=ft.margin.only(bottom=5),
+                ))
+
+        results_column.controls = all_cards
+        refresh_stats_view()
+        refresh_menu_states()
+        page.update()
+
+    # ---------------------------------------------
+    # ПОИСК
+    # ---------------------------------------------
+    async def run_search_async(e=None):
+        word = current_word()
+        if not word:
+            return
+
+        meta = ensure_training_meta()
+        meta["last_use"] = now_ts()
+        save_training(training)
+
+        nonlocal history
+        history = add_to_history(history, word)
+        save_history(history)
+
+        search_btn.disabled = True
+        progress_bar.visible = True
+        results_column.controls.clear()
+        page.update()
+
+        payload = await asyncio.to_thread(heavy_search_task, word, local_data)
+        final_results = payload.get("results", [])
+        current_audio_url["url"] = payload.get("audio_url")
+
+        cards = []
+        if not final_results:
+            cards.append(ft.Text("Ничего не найдено", size=16, color=ft.Colors.GREY))
+
+        for res in final_results:
+            is_local = res.get("is_local", False)
+            border = ft.Colors.GREEN_400 if is_local else ft.Colors.BLUE_700
+            bg = ft.Colors.GREEN_900 if is_local else "#1f1f1f"
+
+            content = ft.Column([
+                ft.Row([
+                    ft.Container(
+                        content=ft.Text(res["pos"], size=10, weight="bold"),
+                        bgcolor=border,
+                        padding=ft.Padding.symmetric(horizontal=6, vertical=2),
+                        border_radius=4,
+                    )
+                ], alignment=ft.MainAxisAlignment.END),
+                ft.Text(res["rus"], size=18, weight="w500"),
+            ])
+
+            if res["ex"]:
+                content.controls.append(ft.Text(f"\"{res['ex']}\"", italic=True, color=ft.Colors.GREY_400, size=14))
+
+            cards.append(ft.Container(
+                content=content,
+                padding=15,
+                bgcolor=bg,
+                border=ft.Border.all(1, border if is_local else ft.Colors.TRANSPARENT),
+                border_radius=12,
+                animate=ft.Animation(duration=300, curve=ft.AnimationCurve.EASE_OUT),
+            ))
+
+        results_column.controls = cards
+        search_btn.disabled = False
+        progress_bar.visible = False
+        refresh_stats_view()
+        refresh_menu_states()
+        page.update()
+
+    search_field.on_submit = run_search_async
+    search_btn.on_click = run_search_async
+
+    # ---------------------------------------------
+    # ТРЕНИРОВКА (флеш-карточки)
+    # ---------------------------------------------
+    train_title = ft.Text("Тренировка", size=22, weight="bold")
+    train_info = ft.Text("Вспомни перевод, нажми «Проверить», затем оцени себя.", color=ft.Colors.GREY_400)
+
+    card_word = ft.Text("", size=34, weight="bold")
+    card_answer = ft.Text("", size=24, visible=False)
+
+    btn_check = ft.ElevatedButton("Проверить")
+    btn_know = ft.ElevatedButton("👍 Знал", disabled=True)
+    btn_dont = ft.ElevatedButton("❌ Не знал", disabled=True)
+    btn_next = ft.OutlinedButton("Следующая")
+
+    current_card = {"word": None, "pool": []}
+
+    async def training_load_next(e=None):
+        current_card["pool"] = build_training_pool()
+        w = pick_next_card(current_card["pool"])
+
+        current_card["word"] = w
+        card_answer.visible = False
+        btn_know.disabled = True
+        btn_dont.disabled = True
+
+        if not w:
+            card_word.value = "Нет карточек 😕"
+            card_answer.value = "Добавь слова в «Мой словарь» или добавь поисковое слово в ⭐ избранное."
+            card_answer.visible = True
+            btn_check.disabled = True
+            btn_next.disabled = True
+            page.update()
+            return
+
+        card_word.value = w
+        card_answer.value = ""
+        btn_check.disabled = False
+        btn_next.disabled = False
+        page.update()
+
+    async def training_show_answer(e=None):
+        w = current_card["word"]
+        if not w:
+            return
+        ans = get_best_translation_for_word(w)
+        card_answer.value = ans if ans else "Перевод не найден"
+        card_answer.visible = True
+        btn_know.disabled = False
+        btn_dont.disabled = False
+
+        meta = ensure_training_meta()
+        meta["last_use"] = now_ts()
+        save_training(training)
+
+        refresh_stats_view()
+        page.update()
+
+    async def training_mark_known(e=None):
+        w = current_card["word"]
+        if not w:
+            return
+        schedule_known(w)
+        bump_stats(True)
+        save_training(training)
+        refresh_stats_view()
+        await training_load_next()
+
+    async def training_mark_dontknow(e=None):
+        w = current_card["word"]
+        if not w:
+            return
+        schedule_dontknow(w)
+        bump_stats(False)
+        save_training(training)
+        refresh_stats_view()
+        await training_load_next()
+
+    btn_check.on_click = training_show_answer
+    btn_know.on_click = training_mark_known
+    btn_dont.on_click = training_mark_dontknow
+    btn_next.on_click = training_load_next
+
+    training_view = ft.Column(
+        [
+            train_title,
+            train_info,
+            ft.Container(height=10),
+            ft.Container(
+                content=ft.Column([card_word, ft.Divider(), card_answer], spacing=10),
+                padding=20,
+                border_radius=16,
+                bgcolor="#1f1f1f",
+                border=ft.Border.all(1, ft.Colors.GREY_800),
+            ),
+            ft.Row([btn_check, btn_know, btn_dont, btn_next], wrap=True),
+        ],
+        spacing=12,
+        expand=True,
+    )
+
+    # ---------------------------------------------
+    # СТАТИСТИКА
+    # ---------------------------------------------
+    stat_total = ft.Text("📚 Всего слов: 0", size=20, weight="bold")
+    stat_today = ft.Text("✅ Сегодня выучено: 0", size=18)
+    stat_rate = ft.Text("🎯 Процент запоминания: 0%", size=18)
+    stat_last = ft.Text("📅 Последнее использование: —", size=18, color=ft.Colors.GREY_400)
+
+    def human_day(ts: int) -> str:
+        if not ts:
+            return "—"
+        d = datetime.fromtimestamp(ts).date()
+        today = datetime.now().date()
+        if d == today:
+            return "сегодня"
+        if (today - d).days == 1:
+            return "вчера"
+        return d.strftime("%d.%m.%Y")
+
+    def get_daily_counts(day: str):
+        meta = ensure_training_meta()
+        daily = meta.get("daily", {})
+        x = daily.get(day, {"known": 0, "dont": 0})
+        return int(x.get("known", 0)), int(x.get("dont", 0))
+
+    def get_counts_last_days(n: int):
+        total_known = 0
+        total_dont = 0
+        for i in range(n):
+            day = (datetime.now().date() - timedelta(days=i)).strftime("%Y-%m-%d")
+            k, d = get_daily_counts(day)
+            total_known += k
+            total_dont += d
+        return total_known, total_dont
+
+    def refresh_stats_view():
+        pool = build_training_pool()
+        total_words = len(pool)
+
+        k_today, d_today = get_daily_counts(today_key())
+        total_today = k_today + d_today
+
+        if total_today > 0:
+            rate = int(round(100 * (k_today / total_today)))
+        else:
+            k7, d7 = get_counts_last_days(7)
+            total7 = k7 + d7
+            rate = int(round(100 * (k7 / total7))) if total7 > 0 else 0
+
+        meta = ensure_training_meta()
+        last_use = int(meta.get("last_use", 0))
+
+        stat_total.value = f"📚 Всего слов: {total_words}"
+        stat_today.value = f"✅ Сегодня выучено: {k_today}"
+        stat_rate.value = f"🎯 Процент запоминания: {rate}%"
+        stat_last.value = f"📅 Последнее использование: {human_day(last_use)}"
+
+    stats_view = ft.Column(
+        [
+            ft.Text("📈 Статистика", size=22, weight="bold"),
+            ft.Container(height=8),
+            ft.Container(
+                content=ft.Column([stat_total, stat_today, stat_rate, stat_last], spacing=10),
+                padding=20,
+                border_radius=16,
+                bgcolor="#1f1f1f",
+                border=ft.Border.all(1, ft.Colors.GREY_800),
+            ),
+            ft.OutlinedButton("Обновить", on_click=lambda e: (refresh_stats_view(), page.update())),
+        ],
+        spacing=12,
+        expand=True,
+    )
+
+    # ---------------------------------------------
+    # МЕНЮ (все функции в выпадающем меню)
+    # ---------------------------------------------
+    def menu_divider():
+        return ft.PopupMenuItem(
+            content=ft.Container(height=1, width=200, bgcolor=ft.Colors.GREY_700),
+            disabled=True
+        )
+
+    mi_fav_toggle = ft.PopupMenuItem(content="Добавить в избранное", icon=ft.Icons.STAR_OUTLINE, on_click=toggle_favorite_searched_word)
+    mi_fav_list = ft.PopupMenuItem(content="Открыть избранные", icon=ft.Icons.STAR, on_click=open_favorites_dialog)
+
+    mi_speak = ft.PopupMenuItem(content="Озвучить слово", icon=ft.Icons.VOLUME_UP, on_click=handle_speak_click)
+
+    mi_view_all = ft.PopupMenuItem(content="Мой словарь", icon=ft.Icons.LIST_ALT, on_click=show_all_words)
+    mi_history = ft.PopupMenuItem(content="История запросов", icon=ft.Icons.HISTORY, on_click=open_history_dialog)
+
+    mi_backup = ft.PopupMenuItem(content="Создать бэкап", icon=ft.Icons.CLOUD_UPLOAD, on_click=handle_backup_click)
+    mi_restore = ft.PopupMenuItem(content="Восстановить бэкап", icon=ft.Icons.CLOUD_DOWNLOAD, on_click=handle_restore_click)
+
+    actions_menu = ft.PopupMenuButton(
+        icon=ft.Icons.MENU,
+        tooltip="Меню",
+        items=[
+            mi_fav_toggle,
+            mi_fav_list,
+            menu_divider(),
+            mi_speak,
+            menu_divider(),
+            mi_view_all,
+            mi_history,
+            menu_divider(),
+            mi_backup,
+            mi_restore,
+        ],
+    )
+
+    def refresh_menu_states():
+        w = current_word()
+        has_word = bool(w)
+        is_fav = has_word and (w in favorites)
+
+        mi_fav_toggle.disabled = not has_word
+        mi_fav_toggle.icon = ft.Icons.STAR if is_fav else ft.Icons.STAR_OUTLINE
+        mi_fav_toggle.icon_color = ft.Colors.AMBER if is_fav else ft.Colors.GREY_500
+        mi_fav_toggle.content = "Убрать из избранного" if is_fav else "Добавить в избранное"
+
+        mi_speak.disabled = not bool(current_audio_url.get("url"))
+
+        # ⭐ “звезда в меню становится золотой”
+        if is_fav:
+            actions_menu.icon = ft.Icons.STAR
+            actions_menu.icon_color = ft.Colors.AMBER
+        else:
+            actions_menu.icon = ft.Icons.MENU
+            actions_menu.icon_color = None
+
+    def on_search_change(e):
+        refresh_menu_states()
+        page.update()
+
+    search_field.on_change = on_search_change
+
+    # ---------------------------------------------
+    # ВКЛАДКА "СЛОВАРЬ"
+    # ---------------------------------------------
+    dictionary_view = ft.Column(
+        [
+            ft.Row([ft.Text("Переводчик", size=24, weight="bold")], alignment=ft.MainAxisAlignment.CENTER),
+            ft.Container(height=10),
+            ft.Row([search_field, search_btn, actions_menu], alignment=ft.MainAxisAlignment.CENTER),
+            progress_bar,
+            results_column,
+        ],
+        expand=True,
+    )
+
+    # ---------------------------------------------
+    # TABS (совместимо с Flet 0.80.x)
+    # ---------------------------------------------
+    tabs = ft.Tabs(
+        length=3,
+        selected_index=0,
+        expand=True,
+        content=ft.Column(
+            expand=True,
+            controls=[
+                ft.TabBar(
+                    tabs=[
+                        ft.Tab(label="Словарь"),
+                        ft.Tab(label="Тренировка"),
+                        ft.Tab(label="📈 Статистика"),
+                    ]
+                ),
+                ft.TabBarView(
+                    expand=True,
+                    controls=[
+                        dictionary_view,
+                        training_view,
+                        stats_view,
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    page.floating_action_button = ft.FloatingActionButton(
+        icon=ft.Icons.ADD,
+        bgcolor=ft.Colors.GREEN_400,
+        on_click=handle_fab_click,
+        tooltip="Добавить слово"
+    )
+
+    page.add(tabs)
+
+    refresh_stats_view()
+    refresh_menu_states()
+    page.update()
+
+    await training_load_next()
+
+
+if __name__ == "__main__":
+    ft.run(main)

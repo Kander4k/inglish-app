@@ -1,0 +1,13 @@
+[project]
+name = "inglish_app"
+version = "1.0.0"
+description = "English dictionary and trainer."
+
+[tool.flet]
+product = "Переводчик"
+org = "com.gimad"
+
+[tool.flet.android]
+bundle_id = "com.gimad.perevodchik"
+adaptive_icon_background = "#ffffff"
+split_per_abi = false
